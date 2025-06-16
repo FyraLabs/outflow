@@ -180,7 +180,7 @@ Outflow can be used to forward data from Windows named pipes to Unix domain sock
 Forward gamepad input from Wine applications to Discord RPC, as if Discord was running inside Wine itself
   
 ```bash
-wine outflow.exe --create-pipe --pipe "\\.\pipe\discord-rpc-0" --socket "/run/user/1000/discord-rpc.sock" # Assuming your UID is 1000
+wine outflow.exe --create-pipe --pipe "\\.\pipe\discord-rpc-0" --socket "/run/user/1000/discord-rpc-0" # Assuming your UID is 1000
 ```
 
 ## Bidirectional Communication
