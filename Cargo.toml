@@ -1,0 +1,24 @@
+[package]
+name = "outflow"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Wine-Linux IPC bridge"
+repository = "https://github.com/FyraLabs/outflow"
+
+[dependencies]
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+ctrlc = "3.0"
+windows = { version = "0.61.3", features = [
+    "Win32",
+    "Win32_Security",
+    "Win32_Storage",
+    "Win32_Storage_FileSystem",
+    "Win32_System",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_Networking",
+    "Win32_Networking_WinSock",
+] }
+clap = { version = "4.5.40", features = ["derive", "env"] }
