@@ -3,7 +3,4 @@
         "--target x86_64-pc-windows-gnu"
     ],
     "rust-analyzer.cargo.target": "x86_64-pc-windows-gnu",
-    "terminal.integrated.env.linux": {
-        "WINEPREFIX": "/home/cappy/.wine",
-    },
 }
