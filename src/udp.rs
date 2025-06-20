@@ -1,86 +1,38 @@
 use std::ffi::CString;
 use std::mem;
-use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, trace};
 use windows::{
-    Win32::Foundation::INVALID_HANDLE_VALUE,
     Win32::Networking::WinSock::{
-        AF_INET, SEND_RECV_FLAGS, SOCK_DGRAM, SOCKADDR_IN,
-        SOCKET_ERROR, WSACleanup, WSADATA, WSAGetLastError, WSAStartup, closesocket,
-        recv, sendto, socket,
+        AF_INET, SEND_RECV_FLAGS, SOCK_DGRAM, SOCKADDR_IN, SOCKET_ERROR, WSACleanup, WSADATA,
+        WSAGetLastError, WSAStartup, closesocket, recv, sendto, socket,
     },
-    Win32::Storage::FileSystem::{
-        CreateFileA, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
-        OPEN_EXISTING, ReadFile, WriteFile,
-    },
+    Win32::Storage::FileSystem::{ReadFile, WriteFile},
     Win32::System::Pipes::PeekNamedPipe,
-    core::PCSTR,
 };
 
 use crate::{Args, set_socket_nonblocking};
 
 pub fn run_udp_mode(pipe_name: &CString, running: Arc<AtomicBool>, args: &Args) {
     unsafe {
-        // Connect to Wine named pipe
+        // Connect to Wine named pipe using the refactored function
         info!("Attempting to connect to named pipe...");
         info!(
             "Will retry indefinitely until pipe '{}' becomes available",
             pipe_name.to_string_lossy()
         );
-        let mut retry_count = 0u32;
-        let pipe = loop {
-            retry_count += 1;
-            if retry_count == 1 {
-                trace!("Trying to open pipe: {}", pipe_name.to_string_lossy());
-            } else if retry_count % 20 == 0 {
-                // Log every 20th attempt to avoid spam
-                info!(
-                    "Still waiting for pipe '{}' (attempt {})",
-                    pipe_name.to_string_lossy(),
-                    retry_count
-                );
-            } else {
-                trace!(
-                    "Trying to open pipe: {} (attempt {})",
-                    pipe_name.to_string_lossy(),
-                    retry_count
-                );
-            }
-            // Open pipe with read/write access if bidirectional mode is enabled
-            let access_mode = if args.bidirectional {
-                FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0
-            } else {
-                FILE_GENERIC_READ.0
-            };
 
-            let h = CreateFileA(
-                PCSTR(pipe_name.as_ptr() as *const u8),
-                access_mode,
-                FILE_SHARE_NONE,
-                Some(null_mut()),
-                OPEN_EXISTING,
-                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
-                None,
-            );
-
-            match h {
-                Ok(handle) if handle != INVALID_HANDLE_VALUE => {
-                    info!("Successfully connected to named pipe");
-                    break handle;
-                }
-                _ => {
-                    debug!(
-                        "Pipe not available, retrying in {}ms...",
-                        args.retry_interval
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(args.retry_interval));
-                    if !running.load(Ordering::SeqCst) {
-                        info!("Shutdown signal received while waiting for pipe");
-                        return;
-                    }
-                }
+        let pipe = match crate::named_pipe::connect_to_pipe_with_retry(
+            pipe_name,
+            running.clone(),
+            args,
+            false,
+        ) {
+            Some(handle) => handle,
+            None => {
+                info!("Pipe connection was cancelled due to shutdown signal");
+                return;
             }
         };
 

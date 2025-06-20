@@ -14,42 +14,81 @@ use windows::{
     core::PCSTR,
 };
 
-/// Attempts to connect to an existing named pipe
-/// Returns the handle if successful, or an error if the pipe doesn't exist or connection fails
-pub fn connect_to_pipe(
-    pipe_name: &str,
-    read_write: bool,
-) -> Result<windows::Win32::Foundation::HANDLE, Box<dyn std::error::Error>> {
+/// Enhanced pipe connection function with retry logic and proper configuration
+/// This replaces the inline pipe connection logic in other modules
+pub fn connect_to_pipe_with_retry(
+    pipe_name: &std::ffi::CString,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    args: &crate::Args,
+    use_overlapped: bool,
+) -> Option<windows::Win32::Foundation::HANDLE> {
+    use std::sync::atomic::Ordering;
+    use tracing::{debug, info, trace};
+
     unsafe {
-        let pipe_name_cstring = CString::new(pipe_name)?;
+        let mut retry_count = 0u32;
 
-        let access_mode = if read_write {
-            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0
-        } else {
-            FILE_GENERIC_READ.0
-        };
+        loop {
+            retry_count += 1;
+            if retry_count == 1 {
+                trace!("Trying to open pipe: {}", pipe_name.to_string_lossy());
+            } else if retry_count % 20 == 0 {
+                // Log every 20th attempt to avoid spam
+                info!(
+                    "Still waiting for pipe '{}' (attempt {})",
+                    pipe_name.to_string_lossy(),
+                    retry_count
+                );
+            } else {
+                trace!(
+                    "Trying to open pipe: {} (attempt {})",
+                    pipe_name.to_string_lossy(),
+                    retry_count
+                );
+            }
 
-        debug!(
-            "Attempting to connect to named pipe: {} (read_write: {})",
-            pipe_name, read_write
-        );
+            // Determine access mode based on bidirectional setting
+            let access_mode = if args.bidirectional {
+                FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0
+            } else {
+                FILE_GENERIC_READ.0
+            };
 
-        let handle = CreateFileA(
-            PCSTR(pipe_name_cstring.as_ptr() as *const u8),
-            access_mode,
-            windows::Win32::Storage::FileSystem::FILE_SHARE_MODE(0),
-            Some(null_mut()),
-            OPEN_EXISTING,
-            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
-            None,
-        )?;
+            // Determine file flags based on usage context
+            let file_flags = if use_overlapped {
+                windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED
+            } else {
+                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0)
+            };
 
-        if handle == INVALID_HANDLE_VALUE {
-            return Err("Failed to connect to named pipe".into());
+            let handle_result = CreateFileA(
+                PCSTR(pipe_name.as_ptr() as *const u8),
+                access_mode,
+                windows::Win32::Storage::FileSystem::FILE_SHARE_NONE,
+                Some(null_mut()),
+                OPEN_EXISTING,
+                file_flags,
+                None,
+            );
+
+            match handle_result {
+                Ok(handle) if handle != INVALID_HANDLE_VALUE => {
+                    info!("Successfully connected to named pipe");
+                    return Some(handle);
+                }
+                _ => {
+                    debug!(
+                        "Pipe not available, retrying in {}ms...",
+                        args.retry_interval
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(args.retry_interval));
+                    if !running.load(Ordering::SeqCst) {
+                        info!("Shutdown signal received while waiting for pipe");
+                        return None;
+                    }
+                }
+            }
         }
-
-        debug!("Successfully connected to named pipe: {}", pipe_name);
-        Ok(handle)
     }
 }
 
