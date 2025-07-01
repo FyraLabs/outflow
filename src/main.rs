@@ -14,7 +14,7 @@ use crate::named_pipe::create_and_run_pipe_server;
 use crate::udp::run_udp_mode;
 use crate::unix_socket::{run_as_client, run_unix_socket_server, try_connect_to_existing_socket};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "wine-socket-proxy")]
 #[command(
     about = "A proxy that forwards data from Windows named pipes to Unix domain sockets or UDP"
@@ -103,6 +103,15 @@ struct Args {
         action = clap::ArgAction::SetTrue
     )]
     create_pipe: bool,
+
+    /// Connect to an outbound-only pipe as client (reads data from pipe and forwards to socket/UDP)
+    /// This is for connecting to pipes created by applications that write data (like LED data)
+    #[arg(
+        long = "outbound-pipe",
+        env = "WINE_PROXY_OUTBOUND_PIPE",
+        action = clap::ArgAction::SetTrue
+    )]
+    outbound_pipe: bool,
 }
 
 fn set_socket_nonblocking(
@@ -158,6 +167,7 @@ fn main() {
     info!("Log level: {}", args.log_level);
     info!("Bidirectional mode: {}", args.bidirectional);
     info!("Create pipe if missing: {}", args.create_pipe);
+    info!("Outbound pipe mode: {}", args.outbound_pipe);
 
     // Set up signal handler for graceful shutdown
     let running = Arc::new(AtomicBool::new(true));
@@ -183,6 +193,25 @@ fn main() {
             }
         }
         return; // Exit after pipe server mode
+    }
+
+    // Connect to outbound pipe as client if requested
+    if args.outbound_pipe {
+        info!("Running in outbound pipe client mode");
+        match crate::named_pipe::connect_and_run_outbound_pipe_client(
+            &args.pipe_name,
+            running,
+            &args,
+        ) {
+            Ok(()) => {
+                info!("Outbound pipe client ended normally");
+            }
+            Err(e) => {
+                error!("Outbound pipe client failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return; // Exit after outbound pipe client mode
     }
 
     if args.use_udp {

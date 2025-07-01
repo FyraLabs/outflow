@@ -47,8 +47,11 @@ pub fn connect_to_pipe_with_retry(
                 );
             }
 
-            // Determine access mode based on bidirectional setting
-            let access_mode = if args.bidirectional {
+            // Determine access mode based on pipe type and bidirectional setting
+            let access_mode = if args.outbound_pipe {
+                // For outbound pipes (server writes, client reads), we need read access
+                FILE_GENERIC_READ.0
+            } else if args.bidirectional {
                 FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0
             } else {
                 FILE_GENERIC_READ.0
@@ -167,6 +170,226 @@ pub fn create_and_run_pipe_server(
 
         Ok(())
     }
+}
+
+/// Creates a pipe client that connects to an existing outbound pipe and forwards data to Unix socket or UDP
+/// This is for connecting to pipes that are write-only from the server's perspective
+/// The client reads data from the pipe and forwards it to the Unix socket/UDP destination
+pub fn connect_and_run_outbound_pipe_client(
+    pipe_name: &str,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    args: &crate::Args,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Connecting to outbound pipe as client: {}", pipe_name);
+
+    let pipe_cstring = CString::new(pipe_name)?;
+
+    // Connect to the pipe with retry logic
+    let pipe_handle = match connect_to_pipe_with_retry(&pipe_cstring, running.clone(), args, false)
+    {
+        Some(handle) => {
+            info!("Successfully connected to outbound pipe: {}", pipe_name);
+            handle
+        }
+        None => {
+            info!("Failed to connect to outbound pipe: {}", pipe_name);
+            return Err("Failed to connect to outbound pipe".into());
+        }
+    };
+
+    // Now forward data from pipe to socket/UDP
+    let total_bytes = if args.use_udp {
+        handle_outbound_pipe_to_udp(pipe_handle, running.clone(), args)
+    } else {
+        handle_outbound_pipe_to_socket(pipe_handle, running.clone(), args)
+    };
+
+    info!(
+        "Outbound pipe client session ended. Total bytes forwarded: {}",
+        total_bytes
+    );
+
+    unsafe {
+        let _ = CloseHandle(pipe_handle);
+    }
+
+    Ok(())
+}
+
+/// Handles reading data from an outbound pipe and forwarding it to a Unix socket
+/// This function will continue reading from the pipe even if no Unix socket listeners are available,
+/// preventing the pipe from blocking the source application
+fn handle_outbound_pipe_to_socket(
+    pipe_handle: windows::Win32::Foundation::HANDLE,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    args: &crate::Args,
+) -> u64 {
+    use crate::unix_socket::try_connect_to_existing_socket;
+    use std::sync::atomic::Ordering;
+
+    let socket_path = match args.socket_path.as_ref() {
+        Some(path) => path,
+        None => {
+            debug!("No socket path provided for outbound pipe forwarding");
+            return 0;
+        }
+    };
+
+    let mut buffer = vec![0u8; args.buffer_size];
+    let mut total_bytes = 0u64;
+    let mut current_socket: Option<windows::Win32::Networking::WinSock::SOCKET> = None;
+
+    while running.load(Ordering::SeqCst) {
+        unsafe {
+            let mut bytes_read = 0u32;
+            let read_result = windows::Win32::Storage::FileSystem::ReadFile(
+                pipe_handle,
+                Some(&mut buffer),
+                Some(&mut bytes_read),
+                None,
+            );
+
+            if read_result.is_ok() && bytes_read > 0 {
+                total_bytes += bytes_read as u64;
+
+                // Try to ensure we have a valid socket connection
+                if current_socket.is_none() {
+                    match try_connect_to_existing_socket(socket_path) {
+                        Ok(sock) => {
+                            debug!("Connected to Unix socket for outbound pipe forwarding");
+                            current_socket = Some(sock);
+                        }
+                        Err(_) => {
+                            // No socket available, but continue reading from pipe to prevent blocking
+                            debug!(
+                                "No Unix socket listener available, discarding {} bytes",
+                                bytes_read
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                // Try to forward data to socket if we have one
+                if let Some(sock) = current_socket {
+                    let send_result = windows::Win32::Networking::WinSock::send(
+                        sock,
+                        &buffer[..bytes_read as usize],
+                        windows::Win32::Networking::WinSock::SEND_RECV_FLAGS(0),
+                    );
+
+                    if send_result <= 0 {
+                        debug!("Failed to send data to socket, disconnecting");
+                        let _ = windows::Win32::Networking::WinSock::closesocket(sock);
+                        current_socket = None;
+                        // Continue reading from pipe even if socket failed
+                    }
+                }
+            } else {
+                let error = windows::Win32::Foundation::GetLastError();
+                if error.0 == 109 {
+                    // ERROR_BROKEN_PIPE - pipe closed
+                    debug!("Outbound pipe closed by server");
+                    break;
+                } else if error.0 != 0 {
+                    debug!("ReadFile failed with error: {}", error.0);
+                    break;
+                }
+                // No data available, sleep briefly to avoid busy waiting
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    // Clean up socket if we have one
+    if let Some(sock) = current_socket {
+        unsafe {
+            windows::Win32::Networking::WinSock::closesocket(sock);
+        }
+    }
+
+    total_bytes
+}
+
+/// Handles reading data from an outbound pipe and forwarding it to UDP
+fn handle_outbound_pipe_to_udp(
+    pipe_handle: windows::Win32::Foundation::HANDLE,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    args: &crate::Args,
+) -> u64 {
+    use std::sync::atomic::Ordering;
+
+    // Create UDP socket and address
+    let (udp_sock, udp_addr) = match crate::udp::create_udp_socket(&args.udp_ip, args.udp_port) {
+        Ok((sock, addr)) => {
+            info!(
+                "Created UDP socket for outbound pipe forwarding to {}:{}",
+                args.udp_ip, args.udp_port
+            );
+            (sock, addr)
+        }
+        Err(e) => {
+            debug!(
+                "Failed to create UDP socket for outbound pipe forwarding: {}",
+                e
+            );
+            return 0;
+        }
+    };
+
+    let mut buffer = vec![0u8; args.buffer_size];
+    let mut total_bytes = 0u64;
+
+    while running.load(Ordering::SeqCst) {
+        unsafe {
+            let mut bytes_read = 0u32;
+            let read_result = windows::Win32::Storage::FileSystem::ReadFile(
+                pipe_handle,
+                Some(&mut buffer),
+                Some(&mut bytes_read),
+                None,
+            );
+
+            if read_result.is_ok() && bytes_read > 0 {
+                total_bytes += bytes_read as u64;
+
+                // Try to forward data to UDP (UDP is connectionless, so we always attempt to send)
+                let send_result = windows::Win32::Networking::WinSock::sendto(
+                    udp_sock,
+                    &buffer[..bytes_read as usize],
+                    0,
+                    &udp_addr as *const windows::Win32::Networking::WinSock::SOCKADDR_IN
+                        as *const _,
+                    std::mem::size_of::<windows::Win32::Networking::WinSock::SOCKADDR_IN>() as i32,
+                );
+
+                if send_result <= 0 {
+                    debug!(
+                        "Failed to send data to UDP (no listener?), but continuing to read from pipe"
+                    );
+                    // Continue reading from pipe even if UDP send failed
+                }
+            } else {
+                let error = windows::Win32::Foundation::GetLastError();
+                if error.0 == 109 {
+                    // ERROR_BROKEN_PIPE - pipe closed
+                    debug!("Outbound pipe closed by server");
+                    break;
+                } else if error.0 != 0 {
+                    debug!("ReadFile failed with error: {}", error.0);
+                    break;
+                }
+                // No data available, sleep briefly to avoid busy waiting
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    unsafe {
+        windows::Win32::Networking::WinSock::closesocket(udp_sock);
+    }
+
+    total_bytes
 }
 
 fn handle_pipe_client_socket(
@@ -289,6 +512,7 @@ mod tests {
             poll_interval: 100,
             bidirectional: false,
             create_pipe: false,
+            outbound_pipe: false,
         }
     }
 
@@ -536,6 +760,26 @@ mod tests {
             "Should fail to create CString with null byte"
         );
     }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_outbound_pipe_client_mode() {
+        // Test that outbound pipe client mode doesn't block when no socket listeners exist
+        let mut args = create_test_args();
+        args.outbound_pipe = true;
+        args.use_udp = true; // Use UDP mode for easier testing
+        args.retry_interval = 10; // Short interval for faster test
+
+        let pipe_name = CString::new(r"\\.\pipe\outbound_client_test").unwrap();
+        let running = Arc::new(AtomicBool::new(false)); // Immediate shutdown to prevent hanging
+
+        // This should not panic or hang even though no pipe exists
+        let result = connect_to_pipe_with_retry(&pipe_name, running, &args, false);
+        assert!(
+            result.is_none(),
+            "Should return None when no outbound pipe exists"
+        );
+    }
 }
 
 // Additional integration tests that test the refactored functionality
@@ -628,5 +872,61 @@ mod integration_tests {
         });
 
         assert!(result.is_ok(), "Pipe server basic setup should not panic");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_outbound_pipe_mode_args() {
+        // Test that outbound pipe mode argument is handled correctly
+        let mut args = super::tests::create_test_args();
+        args.outbound_pipe = true;
+
+        assert!(args.outbound_pipe, "Outbound pipe mode should be settable");
+        assert!(
+            !args.create_pipe,
+            "Should not conflict with regular pipe creation"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_outbound_pipe_client_functionality() {
+        // Test that outbound pipe client mode doesn't block when no socket listeners exist
+        let mut args = super::tests::create_test_args();
+        args.outbound_pipe = true;
+        args.use_udp = true; // Use UDP mode for easier testing
+        args.retry_interval = 10; // Short interval for faster test
+
+        let pipe_name = CString::new(r"\\.\pipe\outbound_client_test").unwrap();
+        let running = Arc::new(AtomicBool::new(false)); // Immediate shutdown to prevent hanging
+
+        // This should not panic or hang even though no pipe exists
+        let result = connect_to_pipe_with_retry(&pipe_name, running, &args, false);
+        assert!(
+            result.is_none(),
+            "Should return None when no outbound pipe exists"
+        );
+    }
+
+    #[test]
+    fn test_outbound_pipe_compatibility() {
+        // Test that outbound pipe mode is compatible with other settings
+        let mut args = super::tests::create_test_args();
+        args.outbound_pipe = true;
+        args.use_udp = true;
+
+        // Should work with UDP
+        assert!(
+            args.outbound_pipe && args.use_udp,
+            "Should work with UDP mode"
+        );
+
+        // Should work with socket mode too
+        args.use_udp = false;
+        args.socket_path = Some("/tmp/test.sock".to_string());
+        assert!(
+            args.outbound_pipe && args.socket_path.is_some(),
+            "Should work with socket mode"
+        );
     }
 }

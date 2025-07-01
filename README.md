@@ -107,6 +107,29 @@ outflow --pipe "\\.\pipe\my_app" --socket "/tmp/my_app.sock" --bidirectional
 outflow --pipe "\\.\pipe\my_app" --udp --udp-port 12345 --bidirectional
 ```
 
+### Outbound Pipe Client Mode
+
+For applications that create write-only named pipes (like LED controllers or other output devices), use the `--outbound-pipe` flag to connect as a client that reads from the pipe:
+
+```bash
+outflow --pipe "\\.\pipe\chuni_led" --socket "/tmp/chuni_led.sock" --outbound-pipe
+```
+
+This mode:
+
+- Connects to an existing outbound pipe created by another application
+- Continuously reads data from the pipe and forwards it to Unix socket/UDP
+- **Does NOT block** when no Unix socket listeners are available - it will discard data but continue reading from the pipe
+- Automatically reconnects to Unix socket listeners when they become available
+- Prevents the source application from freezing when no clients are connected
+
+This is particularly useful for applications that output continuous data (like LED patterns, sensor data, etc.) where you don't want the source to block when there are no consumers.
+
+```bash
+# UDP mode with outbound pipe
+outflow --pipe "\\.\pipe\chuni_led" --udp --udp-port 12345 --outbound-pipe
+```
+
 ## Named Pipe Creation
 
 By default, Outflow expects the named pipe to already exist (created by the Wine application). However, you can use the `--create-pipe` flag to have Outflow create a named pipe server and listen for client connections.
